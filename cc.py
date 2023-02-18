@@ -1,186 +1,127 @@
-import requests
-import pandas as pd
-import numpy as np
-import talib
-import pickle
-from keras.models import load_model
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from sklearn.metrics import mean_squared_error
 
-# 定义API接口URL
-url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h"
+# 3. 模型选择
+def lstm_model(input_shape):
+    """
+    构建LSTM模型
+    """
+    model = keras.Sequential()
+    model.add(layers.LSTM(50, input_shape=input_shape, return_sequences=True))
+    model.add(layers.Dropout(0.2))
+    model.add(layers.LSTM(50, return_sequences=True))
+    model.add(layers.Dropout(0.2))
+    model.add(layers.LSTM(50))
+    model.add(layers.Dropout(0.2))
+    model.add(layers.Dense(1))
 
-# 获取历史数据
-res = requests.get(url)
-data = res.json()
+    return model
 
-# 将数据转换为DataFrame格式
-df = pd.DataFrame(data, columns=["Open time", "Open", "High", "Low", "Close", "Volume",
-                                 "Close time", "Quote asset volume", "Number of trades",
-                                 "Taker buy base asset volume", "Taker buy quote asset volume", "Ignore"])
+# 4. 模型训练
+def train_model(X_train, y_train, X_test, y_test):
+    """
+    训练LSTM模型
+    """
+    model = lstm_model((X_train.shape[1], X_train.shape[2]))
+    model.compile(loss='mean_squared_error', optimizer='adam')
 
-# 将时间戳转换为可读时间
-df["Open time"] = pd.to_datetime(df["Open time"], unit='ms')
+    history = model.fit(X_train, y_train, epochs=10, batch_size=32, validation_data=(X_test, y_test), verbose=1)
 
-# 将字符串类型的数据转换为浮点类型
-df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
+    return model, history
 
-# 计算MA指标
-df["MA5"] = talib.MA(df["Close"], timeperiod=5)
-df["MA10"] = talib.MA(df["Close"], timeperiod=10)
-df["MA20"] = talib.MA(df["Close"], timeperiod=20)
+# 5. 模型评估
+def evaluate_model(model, X_test, y_test, scaler):
+    # 将测试数据集进行归一化
+    X_test_scaled = scaler.transform(X_test)
 
-# 去除不需要的列
-df.drop(columns=["Open time", "Close time", "Quote asset volume", "Number of trades",
-                  "Taker buy base asset volume", "Taker buy quote asset volume", "Ignore"], inplace=True)
+    # 对测试数据进行预测
+    y_pred_scaled = model.predict(X_test_scaled)
 
-# 去除包含NaN的行
-df.dropna(inplace=True)
+    # 将预测结果反归一化
+    y_pred = scaler.inverse_transform(y_pred_scaled)
 
-# 将数据归一化
-scaler = MinMaxScaler()
-df_scaled = pd.DataFrame(scaler.fit_transform(df), columns=df.columns)
+    # 计算均方误差和平均绝对误差
+    mse = mean_squared_error(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
 
-# 将数据划分为训练集和测试集
-X = df_scaled.iloc[:, :-1].values
-y = df_scaled.iloc[:, -1].values
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+    print('均方误差：%.2f' % mse)
+    print('平均绝对误差：%.2f' % mae)
 
-# 将数据转换为3D格式，以符合LSTM网络输入格式
-X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
-X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
+# 6. 参数调优
+def tune_hyperparameters(X_train, y_train, scaler):
+    # 构建 KerasRegressor 对象
+    model = KerasRegressor(build_fn=create_model, verbose=0)
 
-# 构建LSTM模型
-model = Sequential()
-model.add(LSTM(units=50, return_sequences=True, input_shape=(X_train.shape[1], 1)))
-model.add(LSTM(units=50))
-model.add(Dense(units=1))
+    # 定义要调整的参数
+    param_grid = {'batch_size': [32, 64, 128],
+                  'epochs': [10, 20, 30],
+                  'optimizer': ['adam', 'rmsprop']}
 
-# 编译模型
-model.compile(optimizer='adam', loss='mean_squared_error')
+    # 使用 GridSearchCV 进行参数调优
+    grid_search = GridSearchCV(estimator=model, param_grid=param_grid, cv=3)
+    grid_result = grid_search.fit(X_train, y_train)
 
-# 训练模型
-model.fit(X_train, y_train, epochs=50, batch_size=32)
+    # 输出最优参数
+    print('最优参数：', grid_result.best_params_)
 
-# 测试模型
-test_loss = model.evaluate(X_test, y_test, verbose=0)
-print(f"Test loss: {test_loss}")
+    # 根据最优参数重新训练模型
+    model = create_model(optimizer=grid_result.best_params_['optimizer'])
+    model.fit(X_train, y_train, batch_size=grid_result.best_params_['batch_size'], epochs=grid_result.best_params_['epochs'])
 
-# 保存模型
-model.save("btc_model.h5")
+    # 对模型进行评估
+    evaluate_model(model, X_test, y_test, scaler)
 
-# 保存归一化器
-with open("scaler.pkl", "wb") as f:
-    pickle.dump(scaler, f)
+# 7. 预测应用
+def predict(model, X, scaler):
+    # 预测
+    y_pred = model.predict(X)
+    # 将预测结果进行反归一化
+    y_pred = scaler.inverse_transform(y_pred)
+    return y_pred
 
-print("Scaler saved as scaler.pkl")
+# 8. 自动化学习
+def auto_train(X_train, y_train, X_val, y_val, num_features):
+    # 定义Keras Tuner搜索空间
+    def model_builder(hp):
+        model = Sequential()
+        # 添加LSTM层，共搜索三个LSTM层的神经元数
+        for i in range(hp.Int('num_lstm_layers', 1, 3)):
+            # 第一层需要输入维度信息
+            if i == 0:
+                model.add(LSTM(units=hp.Int('units_'+str(i), min_value=32, max_value=256, step=32),
+                               input_shape=(X_train.shape[1], num_features),
+                               return_sequences=True))
+            else:
+                model.add(LSTM(units=hp.Int('units_'+str(i), min_value=32, max_value=256, step=32),
+                               return_sequences=True))
+        # 添加全连接层，搜索一个神经元数
+        model.add(Dense(units=hp.Int('dense_units', min_value=32, max_value=256, step=32)))
+        # 添加输出层
+        model.add(Dense(units=1))
+        # 编译模型
+        model.compile(optimizer=Adam(learning_rate=hp.Choice('learning_rate', values=[1e-2, 1e-3, 1e-4])),
+                      loss='mean_squared_error',
+                      metrics=['mean_squared_error'])
+        return model
 
-# 加载模型和归一化器
-model = load_model("btc_model.h5")
-with open("scaler.pkl", "rb") as f:
-    scaler = pickle.load(f)
+    # 初始化Keras Tuner
+    tuner = kt.Hyperband(
+        model_builder,
+        objective='val_mean_squared_error',
+        max_epochs=10,
+        factor=3,
+        directory='my_dir',
+        project_name='intro_to_kt')
 
-# 获取最新K线数据
-res = requests.get(url)
-data = res.json()
-df_latest = pd.DataFrame(data, columns=["Open time", "Open", "High", "Low", "Close", "Volume",
-                                        "Close time", "Quote asset volume", "Number of trades",
-                                        "Taker buy base asset volume", "Taker buy quote asset volume", "Ignore"])
-df_latest["Open time"] = pd.to_datetime(df_latest["Open time"], unit='ms')
-df_latest[["Open", "High", "Low", "Close", "Volume"]] = df_latest[["Open", "High", "Low", "Close", "Volume"]].astype(float)
-df_latest.drop(columns=["Open time", "Close time", "Quote asset volume", "Number of trades",
-                         "Taker buy base asset volume", "Taker buy quote asset volume", "Ignore"], inplace=True)
+    # 开始搜索最佳模型超参数
+    tuner.search(X_train, y_train, epochs=10, validation_data=(X_val, y_val))
 
-# 计算最新K线数据的MA指标
-df_latest["MA5"] = talib.MA(df_latest["Close"], timeperiod=5)
-df_latest["MA10"] = talib.MA(df_latest["Close"], timeperiod=10)
-df_latest["MA20"] = talib.MA(df_latest["Close"], timeperiod=20)
+    # 获取最佳超参数和最佳模型
+    best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+    best_model = tuner.hypermodel.build(best_hps)
 
-# 去除包含NaN的行
-df_latest.dropna(inplace=True)
-
-# 将最新K线数据归一化
-df_latest_scaled = pd.DataFrame(scaler.transform(df_latest), columns=df_latest.columns)
-
-# 将最新K线数据转换为3D格式
-X_latest = df_latest_scaled.iloc[:, :-1].values
-X_latest = X_latest.reshape(X_latest.shape[0], X_latest.shape[1], 1)
-
-# 预测最新K线数据的涨跌趋势
-y_latest_pred = model.predict(X_latest)
-y_latest_pred = np.round(scaler.inverse_transform(y_latest_pred)[-1][0], 2)
-
-# 计算最新K线数据的涨跌幅度
-latest_close = df_latest.iloc[-1]["Close"]
-change_percent = (y_latest_pred - latest_close) / latest_close * 100
-
-print(f"Latest close price: {latest_close:.2f}")
-print(f"Predicted close price: {y_latest_pred:.2f}")
-print(f"Change percentage: {change_percent:.2f}%")
-
-# 将最新K线数据的涨跌趋势和涨跌幅度保存到文件中
-with open("latest_prediction.txt", "w") as f:
-    f.write(f"Latest close price: {latest_close:.2f}\n")
-    f.write(f"Predicted close price: {y_latest_pred:.2f}\n")
-    f.write(f"Change percentage: {change_percent:.2f}%\n")
-
-print("Prediction saved as latest_prediction.txt")
-
-# 读取数据并将数据拆分为特征和目标变量
-features, targets = read_data()
-
-# 对数据进行标准化处理
-features = standardize_data(features)
-
-# 训练模型
-model = train_model(features, targets)
-
-# 预测目标变量
-predictions = predict(model, features)
-
-# 计算并打印性能指标
-accuracy = compute_accuracy(predictions, targets)
-print(f"Accuracy: {accuracy}")
-
-# 读取数据并将数据拆分为特征和目标变量
-features, targets = read_data()
-
-# 对数据进行标准化处理
-features = standardize_data(features)
-
-# 交叉验证评估模型
-scores = cross_val_score(model, features, targets, cv=5)
-print(f"Cross-validation scores: {scores}")
-print(f"Mean cross-validation score: {scores.mean()}")
-# 计算并打印其他性能指标，如精确度、召回率、F1得分等
-precision = compute_precision(predictions, targets)
-recall = compute_recall(predictions, targets)
-f1_score = compute_f1_score(predictions, targets)
-
-print(f"Precision: {precision}")
-print(f"Recall: {recall}")
-print(f"F1 score: {f1_score}")
-
-
-# 定义参数网格，以便对超参数进行网格搜索
-param_grid = {
-    "alpha": [0.01, 0.1, 1.0, 10.0],
-    "hidden_layer_sizes": [(10,), (50,), (100,), (10, 10), (50, 50), (100, 100)]
-}
-
-# 使用网格搜索调整超参数
-from sklearn.model_selection import GridSearchCV
-
-grid_search = GridSearchCV(model, param_grid, cv=5)
-grid_search.fit(train_data, train_labels)
-
-# 打印最佳参数组合
-print("Best parameters:", grid_search.best_params_)
-
-# 使用最佳参数训练模型
-best_model = MLPRegressor(**grid_search.best_params_)
-best_model.fit(train_data, train_labels)
-
-
+    # 训练最佳模型并返回
+    best_model.fit(X_train, y_train, epochs=10, validation_data=(X_val, y_val))
+    return best_model
